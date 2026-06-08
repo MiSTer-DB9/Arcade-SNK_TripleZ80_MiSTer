@@ -168,8 +168,12 @@ module emu
 	// 1 - D-/TX
 	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
-	input   [6:0] USER_IN,
-	output  [6:0] USER_OUT,
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USER_OSD + per-pin push-pull mask, USER_IO widened to 8 bits
+	output        USER_OSD,
+	output  [7:0] USER_PP,
+	input   [7:0] USER_IN,
+	output  [7:0] USER_OUT,
+	// [MiSTer-DB9 END]
 
 	input         OSD_STATUS
 );
@@ -177,7 +181,9 @@ module emu
 ///////// Default values for ports not used in this core /////////
 
 assign ADC_BUS  = 'Z;
-//assign USER_OUT = '1;
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USER_PP driven by wrapper; USER_OUT driven by joydb (USER_OUT_DRIVE) below
+assign USER_PP = USER_PP_DRIVE;
+// [MiSTer-DB9 END]
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
@@ -234,10 +240,10 @@ localparam CONF_STR = {
 	"P2O[17],Back Layer,On,Off;",
 	"P2O[18],Front Layer,On,Off;",
 	"P2-;",
-	"P3,SNAC;",
-	"P3-;",
-	"P3O[21:20],DB15 Devices,Off,OnlyP1,OnlyP2,P1&P2;",
-	"P3-;",
+	// [MiSTer-DB9-Pro BEGIN] - Saturn-first joy_type (canonical bit notation)
+	"O[127:126],UserIO Joystick,Off,Saturn,DB9MD,DB15;",
+	"O[125],UserIO Players, 1 Player,2 Players;",
+	// [MiSTer-DB9-Pro END]
 	"DIP;",
 	"-;",
 	"T[0],Reset;",
@@ -273,37 +279,75 @@ wire  [1:0] buttons;
 wire [127:0] status;
 wire [10:0] ps2_key;
 
-wire [15:0] joystick_0, joystick_1;
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: rename USB joystick wires
+wire [15:0] joystick_0_USB, joystick_1_USB;
+// [MiSTer-DB9 END]
 
-//SNAC joysticks
-wire [1:0] SNAC_dev;	
-assign SNAC_dev = status[21:20];
-wire         JOY_CLK, JOY_LOAD;
-wire         JOY_DATA  = USER_IN[5];
+// [MiSTer-DB9-Pro BEGIN] - DB controllers muted while OSD is open; remap joydb bits to SNK_TripleZ80 order
+// Consumer button order (CONF_STR "J1,Fire,Missile,Armor,Start,Coin,Pause,Service"):
+//   [3:0]=R/L/D/U  [4]=Fire  [5]=Missile  [6]=Armor  [7]=Start  [8]=Coin  [9]=Service  [10]=Pause
+// joydb_1 source bits: [3:0]=R/L/D/U [4]=A [5]=B [6]=C [8]=Y [9]=Z [10]=Start [11]=Mode/R
+//   Fire    <- joydb_1[4]  (A)
+//   Missile <- joydb_1[5]  (B)
+//   Armor   <- joydb_1[6]  (C)
+//   Start   <- joydb_1[10] (Start)
+//   Coin    <- joydb_1[11] (Mode/R-trigger)
+//   Service <- joydb_1[9]  (Z,  spare face button)  -- best-effort
+//   Pause   <- joydb_1[8]  (Y,  spare face button)  -- best-effort
+// NOTE: this is an 8-way+3-fire (Alpha Mission / ASO / Arian Mission) board; it
+// has no rotary control, so no rotate-left/right buttons exist to map.
+wire [15:0] joystick_0 = joydb_1ena ? (OSD_STATUS ? 16'b0 : {5'b0, joydb_1[8], joydb_1[9], joydb_1[11], joydb_1[10], joydb_1[6], joydb_1[5], joydb_1[4], joydb_1[3:0]}) : joystick_0_USB;
+wire [15:0] joystick_1 = joydb_2ena ? (OSD_STATUS ? 16'b0 : {5'b0, joydb_2[8], joydb_2[9], joydb_2[11], joydb_2[10], joydb_2[6], joydb_2[5], joydb_2[4], joydb_2[3:0]}) : joydb_1ena ? joystick_0_USB : joystick_1_USB;
+// [MiSTer-DB9-Pro END]
 
-always_comb begin
-	USER_OUT[0] = JOY_LOAD;
-	USER_OUT[1] = JOY_CLK;
-	USER_OUT[2] = 1'b1;
-	USER_OUT[3] = 1'b1;
-	USER_OUT[4] = 1'b1;
-	USER_OUT[5] = 1'b1;
-	USER_OUT[6] = 1'b1;
-end
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joydb wrapper
+wire         CLK_JOY = CLK_50M;                 // Assign clock between 40-50Mhz
+wire   [1:0] joy_type_raw    = status[127:126]; // 0=Off, 1=Saturn, 2=DB9MD, 3=DB15
+wire         joy_2p          = status[125];
+// SNAC cores: replace 1'b0 with the core's SNAC enable expression so SNAC
+// preempts the joydb wrapper on shared USER_IO pins. Default 1'b0 is no-op.
+wire         snac_active     = 1'b0;
+// MT32-pi cores on primary USER_IO: replace 1'b0 with the core's MT32-active
+// expression. Default 1'b0 (no MT32 on this core).
+wire         mt32_primary_active = 1'b0;
+wire   [1:0] joy_type        = snac_active ? 2'd0 : joy_type_raw;
+wire         joy_db9md_en    = (joy_type == 2'd2);
+wire         joy_db15_en     = (joy_type == 2'd3);
+wire         joy_any_en      = |joy_type;
+// [MiSTer-DB9 END]
 
-wire [15:0] JOY_DB1 = (SNAC_dev[0]) ? JOYDB15_1 : 16'd0;
-wire [15:0] JOY_DB2 = (SNAC_dev[1]) ? JOYDB15_2 : 16'd0;
+// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
+wire         saturn_unlocked;                   // driven by hps_io UIO_DB9_KEY (0xFE)
+// [MiSTer-DB9-Pro END]
 
-wire [15:0] JOYDB15_1,JOYDB15_2;
-joy_db15 joy_db15
-(
-  .clk       ( clk_53p6  ), //53.6MHz
-  .JOY_CLK   ( JOY_CLK   ),
-  .JOY_DATA  ( JOY_DATA  ),
-  .JOY_LOAD  ( JOY_LOAD  ),
-  .joystick1 ( JOYDB15_1 ),
-  .joystick2 ( JOYDB15_2 )	  
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joydb wrapper wires + instance
+wire   [7:0] USER_OUT_DRIVE;
+wire   [7:0] USER_PP_DRIVE;
+wire  [15:0] joydb_1, joydb_2;
+wire         joydb_1ena, joydb_2ena;
+wire  [15:0] joy_raw_payload;
+
+joydb joydb (
+  .clk             ( CLK_JOY         ),
+  .USER_IN         ( USER_IN         ),
+  .OSD_STATUS          ( OSD_STATUS          ),
+  .snac_active         ( snac_active         ),
+  .mt32_primary_active ( mt32_primary_active ),
+  .joy_type        ( joy_type        ),
+  .joy_2p          ( joy_2p          ),
+  .saturn_unlocked ( saturn_unlocked ),
+  .USER_OUT_DRIVE  ( USER_OUT_DRIVE  ),
+  .USER_PP_DRIVE   ( USER_PP_DRIVE   ),
+  .USER_OSD        ( USER_OSD        ),
+  .joydb_1         ( joydb_1         ),
+  .joydb_2         ( joydb_2         ),
+  .joydb_1ena      ( joydb_1ena      ),
+  .joydb_2ena      ( joydb_2ena      ),
+  .joy_raw         ( joy_raw_payload )
 );
+
+assign USER_OUT = USER_OUT_DRIVE;
+// [MiSTer-DB9 END]
 
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
@@ -329,8 +373,14 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_wait(ioctl_wait),
 	
 	.ps2_key(ps2_key),
-	.joystick_0(joystick_0),
-	.joystick_1(joystick_1)
+	.joystick_0(joystick_0_USB),
+	.joystick_1(joystick_1_USB),
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joy_raw
+	.joy_raw(OSD_STATUS ? joy_raw_payload : 16'b0),
+	// [MiSTer-DB9 END]
+	// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
+	.saturn_unlocked(saturn_unlocked)
+	// [MiSTer-DB9-Pro END]
 );
 
 // PAUSE SYSTEM
@@ -506,29 +556,34 @@ wire m_pause2; //active high
 //    10 9876543210
 //----LS FEDCBAUDLR
 
-	assign m_up1       = (SNAC_dev[0]) ? ~JOY_DB1[3]  : ~joystick_0[3];
-	assign m_down1     = (SNAC_dev[0]) ? ~JOY_DB1[2]  : ~joystick_0[2];
-	assign m_left1     = (SNAC_dev[0]) ? ~JOY_DB1[1]  : ~joystick_0[1];
-	assign m_right1    = (SNAC_dev[0]) ? ~JOY_DB1[0]  : ~joystick_0[0];
-	assign m_shot1     = (SNAC_dev[0]) ? ~JOY_DB1[4]  : ~joystick_0[4]; //DB15 (NeoGeo): A 
-	assign m_missile1  = (SNAC_dev[0]) ? ~JOY_DB1[5]  : ~joystick_0[5]; //DB15 (NeoGeo): B
-	assign m_armor1    = (SNAC_dev[0]) ? ~JOY_DB1[6]  : ~joystick_0[6]; //DB15 (NeoGeo): C
-	assign m_start1    = (SNAC_dev[0]) ? ~JOY_DB1[10] : ~joystick_0[7]; //DB15 (NeoGeo): Start
-	assign m_coin1     = (SNAC_dev[0]) ? ~JOY_DB1[11] : ~joystick_0[8]; //DB15 (NeoGeo): Select 
-	assign m_service1  = (SNAC_dev[0]) ?  ~(JOY_DB1[5] & JOY_DB1[11]) : ~joystick_0[9]; //DB15 (NeoGeo): Select+B
-	assign m_pause1    = (SNAC_dev[0]) ?   (JOY_DB1[4] & JOY_DB1[11]) :  joystick_0[10]; //DB15 (NeoGeo): Select+A
-	
-	assign m_up2       = (SNAC_dev[1]) ? ~JOY_DB2[3]  : ~joystick_1[3];
-	assign m_down2     = (SNAC_dev[1]) ? ~JOY_DB2[2]  : ~joystick_1[2];
-	assign m_left2     = (SNAC_dev[1]) ? ~JOY_DB2[1]  : ~joystick_1[1];
-	assign m_right2    = (SNAC_dev[1]) ? ~JOY_DB2[0]  : ~joystick_1[0];
-	assign m_shot2     = (SNAC_dev[1]) ? ~JOY_DB2[4]  : ~joystick_1[4]; //DB15 (NeoGeo): A 
-	assign m_missile2  = (SNAC_dev[1]) ? ~JOY_DB2[5]  : ~joystick_1[5]; //DB15 (NeoGeo): B
-	assign m_armor2    = (SNAC_dev[1]) ? ~JOY_DB2[6]  : ~joystick_1[6]; //DB15 (NeoGeo): C
-	assign m_start2    = (SNAC_dev[1]) ? ~JOY_DB2[10] : ~joystick_1[7]; //DB15 (NeoGeo): Start
-	assign m_coin2     = (SNAC_dev[1]) ? ~JOY_DB2[11] : ~joystick_1[8]; //DB15 (NeoGeo): Select 
-	assign m_service2  = (SNAC_dev[1]) ?  ~(JOY_DB2[5] & JOY_DB2[11]) : ~joystick_1[9]; //DB15 (NeoGeo): Select+B
-	assign m_pause2    = (SNAC_dev[1]) ?   (JOY_DB2[4] & JOY_DB2[11]) :  joystick_1[10]; //DB15 (NeoGeo): Select+A
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: DB15/DB9MD/Saturn now flow through
+	// joystick_0/_1 via the joydb wrapper (remapped to this core's bit order at
+	// the joystick_0/_1 mux above), so the upstream SNAC_dev/JOY_DB ternaries are
+	// removed and these reads are plain joystick_0/_1 again.
+	assign m_up1       = ~joystick_0[3];
+	assign m_down1     = ~joystick_0[2];
+	assign m_left1     = ~joystick_0[1];
+	assign m_right1    = ~joystick_0[0];
+	assign m_shot1     = ~joystick_0[4];
+	assign m_missile1  = ~joystick_0[5];
+	assign m_armor1    = ~joystick_0[6];
+	assign m_start1    = ~joystick_0[7];
+	assign m_coin1     = ~joystick_0[8];
+	assign m_service1  = ~joystick_0[9];
+	assign m_pause1    =  joystick_0[10];
+
+	assign m_up2       = ~joystick_1[3];
+	assign m_down2     = ~joystick_1[2];
+	assign m_left2     = ~joystick_1[1];
+	assign m_right2    = ~joystick_1[0];
+	assign m_shot2     = ~joystick_1[4];
+	assign m_missile2  = ~joystick_1[5];
+	assign m_armor2    = ~joystick_1[6];
+	assign m_start2    = ~joystick_1[7];
+	assign m_coin2     = ~joystick_1[8];
+	assign m_service2  = ~joystick_1[9];
+	assign m_pause2    =  joystick_1[10];
+	// [MiSTer-DB9 END]
 
 assign PLAYER1 = {2'b11,m_up1,m_down1,m_right1,m_left1,m_service1,4'b1111, m_armor1,m_missile1,m_shot1,m_start1,m_coin1};
 assign PLAYER2 = {2'b11,m_up2,m_down2,m_right2,m_left2,m_service2,4'b1111, m_armor1,m_missile1,m_shot1,m_start1,m_coin1};
